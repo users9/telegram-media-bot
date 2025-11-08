@@ -1,12 +1,11 @@
-# main.py — PTB v21.6 + Flask healthcheck (Render-friendly)
-
-import os, re, tempfile, logging
+# main.py — PTB v21 + Flask health check (Render)
+import os, re, tempfile, logging, asyncio
 from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
 
 from flask import Flask
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -17,10 +16,10 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # ===== الإعدادات =====
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # لا تضع كلمة bot هنا
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # لا تكتب bot هنا، قيمته تكون التوكن فقط
 SNAP_URL = "https://snapchat.com/add/uckr"
 
-# المنصات المسموحة
+# المنصات المسموح بها
 ALLOWED_HOSTS = {
     # YouTube
     "youtube.com", "www.youtube.com", "youtu.be",
@@ -33,22 +32,23 @@ ALLOWED_HOSTS = {
     # TikTok
     "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com"
 }
-
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
+
+# أحجام نحاولها لتقليل الحجم وإرساله كـ فيديو/صورة فقط
 TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
 
-# ===== Flask للـ Health Check =====
-flask_app = Flask(__name__)
+# ===== Flask (Health check) =====
+app_http = Flask(__name__)
 
-@flask_app.route("/")
+@app_http.route("/")
 def home():
     return "Bot is running!"
 
 def run_flask():
-    port = int(os.getenv("PORT", "10000"))
-    flask_app.run(host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 10000))
+    app_http.run(host="0.0.0.0", port=port, debug=False)
 
-# ===== الواجهة والأزرار =====
+# ===== واجهة الأزرار والرسائل =====
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
@@ -61,6 +61,7 @@ WELCOME_MSG = (
     f"🔗 {SNAP_URL}\n\n"
     "بعد الإضافة، ارجع واضغط **تم، رجعت** أو أرسل **/start** مرة ثانية."
 )
+
 NOTICE_MSG = (
     "⚠️ **تنبيه مهم:**\n"
     "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
@@ -102,11 +103,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def snap_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     text = (update.message.text or "").strip()
     m = URL_RE.search(text)
     if not m:
@@ -196,33 +198,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if last_error:
             log.exception("Send failed", exc_info=last_error)
 
-# ===== تهيئة التطبيق (v21.6) =====
-async def on_startup(app: Application):
-    me = await app.bot.get_me()
-    log.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
-    # نحذف أي Webhook عالق لأننا نستخدم polling
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=False)
-    except Exception as e:
-        log.warning("delete_webhook failed: %s", e)
-
-def build_app() -> Application:
+# ===== تشغيل التطبيق =====
+async def run_bot():
     if not TOKEN:
         raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
+
     app_tg = Application.builder().token(TOKEN).build()
+
+    # Handlers
     app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("help", help_cmd))
     app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
     app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-    app_tg.post_init = on_startup
-    return app_tg
 
-# ===== نقطة التشغيل =====
-if __name__ == "__main__":
-    # شغّل Flask في الخلفية
+    # تنظيف أي Webhook سابق (ضروري مع polling)
+    await app_tg.bot.delete_webhook(drop_pending_updates=True)
+
+    me = await app_tg.bot.get_me()
+    log.info(f"✅ Logged in as @{me.username} (id={me.id})")
+
+    # تشغيل الـ polling في الثريد الرئيسي (لا إشارات ولا إغلاق لوب يدوي)
+    log.info("✅ Telegram polling started")
+    await app_tg.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+def main():
+    # شغّل Flask في ثريد جانبي للهيلث تشيك
     Thread(target=run_flask, daemon=True).start()
+    # شغّل البوت في الثريد الرئيسي (مهم لتفادي مشاكل الإشارات واللوب)
+    asyncio.run(run_bot())
 
-    # شغّل Telegram polling في الخيط الرئيسي (مهم لتفادي مشاكل الحدث)
-    application = build_app()
-    # ملاحظة: لا تستخدم asyncio.run هنا، ولا تشغّل polling داخل ثريد آخر.
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+if __name__ == "__main__":
+    main()
