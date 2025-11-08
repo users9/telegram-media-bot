@@ -1,5 +1,5 @@
-# main.py
-import os, re, tempfile, logging
+# main.py (متوافق مع python-telegram-bot==21.6)
+import os, re, tempfile, logging, asyncio
 from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 SNAP_URL = "https://snapchat.com/add/uckr"
 
-# المسموح: YouTube / Instagram / X / Snapchat / TikTok
+# المنصات المسموحة
 ALLOWED_HOSTS = {
     # YouTube
     "youtube.com", "www.youtube.com", "youtu.be",
@@ -31,10 +31,7 @@ ALLOWED_HOSTS = {
     # TikTok
     "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com"
 }
-
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
-
-# نحاول أحجام أقل تدريجيًا لنضمن الإرسال كـ فيديو/صورة فقط
 TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
 
 # ===== Flask للـ Health Check =====
@@ -44,7 +41,11 @@ app = Flask(__name__)
 def home():
     return "Bot is running!"
 
-# ===== الواجهة والأزرار =====
+def run_flask():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# ===== واجهة وأزرار =====
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
@@ -84,7 +85,6 @@ def pick_format_for(limit_bytes: int | None) -> str:
 
 # ===== Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # أول /start: ترحيب + زر السناب؛ ثاني /start أو بعد الرجوع: التنبيه + طلب الرابط
     if not context.user_data.get("welcomed"):
         context.user_data["welcomed"] = True
         await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown", reply_markup=snap_keyboard())
@@ -128,7 +128,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_error = None
     sent_ok = False
 
-    # نحاول عدة صيغ/حدود حتى نتمكّن من إرسال فيديو/صورة (بدون document وبدون روابط)
+    # محاولات متعددة لاختيار صيغة/حجم مناسب للإرسال كوسائط
     for limit in TARGET_SIZES + [None]:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -194,8 +194,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if last_error:
             logging.exception("Send failed", exc_info=last_error)
 
-# ===== تشغيل البوت في خيط منفصل (متوافق مع v21.6) =====
-def start_bot_thread():
+# ===== تشغيل البوت (v21 الطريقة الصحيحة بدون مشاكل إشارات) =====
+async def build_app():
     if not TOKEN:
         raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
 
@@ -205,24 +205,27 @@ def start_bot_thread():
     app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
     app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
-    # فحص سريع للتوكن عند التشغيل
-    async def _probe(app):
-        me = await app.bot.get_me()
+    async def _probe(_app):
+        me = await _app.bot.get_me()
         print(f"✅ BOT OK: @{me.username} (id={me.id})")
     app_tg.post_init = _probe
 
-    print("✅ Telegram polling starting…")
-    # IMPORTANT: تشغيل بدون Signals عشان ما يطيح في Thread
-    app_tg.run_polling(
-        stop_signals=None,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        close_loop=False,
-    )
+    return app_tg
+
+async def run_bot():
+    app_tg = await build_app()
+
+    # نبدأ Flask في خيط جانبي
+    Thread(target=run_flask, daemon=True).start()
+
+    # تسلسل v21 بدون run_polling لتفادي الإشارات:
+    await app_tg.initialize()
+    await app_tg.start()
+    print("✅ Telegram polling started")
+    await app_tg.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await app_tg.updater.wait_closed()
+    await app_tg.stop()
+    await app_tg.shutdown()
 
 if __name__ == "__main__":
-    # بوت تيليجرام يشتغل في خيط خلفي
-    Thread(target=start_bot_thread, daemon=True).start()
-    # Flask في الخيط الأساسي لصحّة Render
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    asyncio.run(run_bot())
