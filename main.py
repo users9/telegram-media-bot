@@ -1,5 +1,5 @@
 # main.py
-import os, re, tempfile, logging, asyncio
+import os, re, tempfile, logging
 from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,28 +18,33 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 SNAP_URL = "https://snapchat.com/add/uckr"
 
+# المسموح: YouTube / Instagram / X / Snapchat / TikTok
 ALLOWED_HOSTS = {
+    # YouTube
     "youtube.com", "www.youtube.com", "youtu.be",
+    # X (Twitter)
     "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+    # Snapchat
     "snapchat.com", "www.snapchat.com", "story.snapchat.com",
+    # Instagram
     "instagram.com", "www.instagram.com",
+    # TikTok
     "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com"
 }
+
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
+
+# نحاول أحجام أقل تدريجيًا لنضمن الإرسال كـ فيديو/صورة فقط
 TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
 
-# ===== Flask (للـ Health Check) =====
+# ===== Flask للـ Health Check =====
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot is running!"
 
-def start_flask():
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
-
-# ===== واجهة Telegram =====
+# ===== الواجهة والأزرار =====
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
@@ -77,7 +82,9 @@ def pick_format_for(limit_bytes: int | None) -> str:
         "b"
     )
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== Handlers =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # أول /start: ترحيب + زر السناب؛ ثاني /start أو بعد الرجوع: التنبيه + طلب الرابط
     if not context.user_data.get("welcomed"):
         context.user_data["welcomed"] = True
         await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown", reply_markup=snap_keyboard())
@@ -87,14 +94,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أرسل رابط فيديو/صورة من: YouTube / Instagram / X / Snapchat / TikTok.\n"
-        "سيتم الإرسال كفيديو/صورة فقط.",
+        "سيتم الإرسال كفيديو/صورة فقط (بدون ملفات).",
         reply_markup=snap_keyboard()
     )
 
 async def snap_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -121,6 +128,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_error = None
     sent_ok = False
 
+    # نحاول عدة صيغ/حدود حتى نتمكّن من إرسال فيديو/صورة (بدون document وبدون روابط)
     for limit in TARGET_SIZES + [None]:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -157,11 +165,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not file_path or not file_path.exists():
                 continue
 
-            try:
-                title = (info.get("title") if isinstance(info, dict) else "الملف") or "الملف"
-                title = title[:990]
-                suffix = file_path.suffix.lower()
+            title = (info.get("title") if isinstance(info, dict) else "الملف") or "الملف"
+            title = title[:990]
+            suffix = file_path.suffix.lower()
 
+            try:
                 if suffix in {".mp4", ".mov", ".mkv", ".webm"}:
                     await update.message.reply_video(video=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
                     sent_ok = True
@@ -179,30 +187,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not sent_ok:
         await update.message.reply_text(
-            "❌ تعذّر إرسال الوسائط حتى بعد تخفيض الجودة. جرّب فيديو أقصر/جودة أقل.",
+            "❌ تعذّر إرسال الوسائط تلقائيًا حتى بعد تخفيض الجودة.\n"
+            "جرّب فيديو أقصر/جودة أقل من نفس المنصة.",
             reply_markup=snap_keyboard()
         )
         if last_error:
             logging.exception("Send failed", exc_info=last_error)
 
-async def run_bot_async():
+# ===== تشغيل البوت في خيط منفصل (متوافق مع v21.6) =====
+def start_bot_thread():
     if not TOKEN:
         raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
+
     app_tg = Application.builder().token(TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", start_cmd))
+    app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("help", help_cmd))
     app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
     app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
-    # فحص التوكن يُطبع في اللوق
-    me = await app_tg.bot.get_me()
-    print(f"✅ BOT OK: @{me.username} (id={me.id})")
+    # فحص سريع للتوكن عند التشغيل
+    async def _probe(app):
+        me = await app.bot.get_me()
+        print(f"✅ BOT OK: @{me.username} (id={me.id})")
+    app_tg.post_init = _probe
 
-    # تشغيل polling في الثريد الرئيسي (لا إشارات ولا مشاكل)
-    await app_tg.run_polling(stop_signals=None, allowed_updates=Update.ALL_TYPES)
+    print("✅ Telegram polling starting…")
+    # IMPORTANT: تشغيل بدون Signals عشان ما يطيح في Thread
+    app_tg.run_polling(
+        stop_signals=None,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False,
+    )
 
 if __name__ == "__main__":
-    # شغّل Flask في ثريد جانبي
-    Thread(target=start_flask, daemon=True).start()
-    # وشغّل البوت في الثريد الرئيسي
-    asyncio.run(run_bot_async())
+    # بوت تيليجرام يشتغل في خيط خلفي
+    Thread(target=start_bot_thread, daemon=True).start()
+    # Flask في الخيط الأساسي لصحّة Render
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
