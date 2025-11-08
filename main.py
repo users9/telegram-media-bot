@@ -1,5 +1,5 @@
 # main.py
-import os, re, tempfile, logging
+import os, re, tempfile, logging, asyncio
 from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
@@ -8,82 +8,210 @@ from flask import Flask
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
+# ===== إعدادات عامة =====
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+SNAP_URL = "https://snapchat.com/add/uckr"
 
-# ───────────────────────────────────────────────
-# إعداد Flask (لـ Render Health Check)
-# ───────────────────────────────────────────────
+# المسموح: YouTube / Instagram / X(Twitter) / Snapchat / TikTok
+ALLOWED_HOSTS = {
+    # YouTube
+    "youtube.com", "www.youtube.com", "youtu.be",
+    # X (Twitter)
+    "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+    # Snapchat
+    "snapchat.com", "www.snapchat.com", "story.snapchat.com",
+    # Instagram
+    "instagram.com", "www.instagram.com",
+    # TikTok
+    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com"
+}
+URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
+
+# نحاول أحجام أقل تدريجيًا لنضمن الإرسال كـ فيديو/صورة فقط
+TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
+
+# ===== Flask للـ Health Check في Render =====
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running ✅"
+    return "Bot is running!"
 
+# ===== واجهة وأزرار =====
+def snap_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
+        [InlineKeyboardButton("✅ تم، رجعت", callback_data="snap_back")]
+    ])
 
-# ───────────────────────────────────────────────
-# دوال البوت الأساسية
-# ───────────────────────────────────────────────
+WELCOME_MSG = (
+    "👋 **مرحبًا!**\n\n"
+    "قبل ما نبدأ… ياليت تضيفني على السناب:\n"
+    f"🔗 {SNAP_URL}\n\n"
+    "بعد الإضافة، ارجع واضغط **تم، رجعت** أو أرسل **/start** مرة ثانية."
+)
+NOTICE_MSG = (
+    "⚠️ **تنبيه مهم:**\n"
+    "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
+    "رجاءً استخدمه في الخير فقط.\n\n"
+    "الآن أرسل رابط الميديا من: YouTube / Instagram / X / Snapchat / TikTok."
+)
 
+def is_allowed(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        return host in ALLOWED_HOSTS
+    except Exception:
+        return False
+
+def pick_format_for(limit_bytes: int | None) -> str:
+    if limit_bytes is None:
+        return "bv*+ba/best"
+    return (
+        f"(bv*+ba/b)[filesize<={limit_bytes}]/"
+        f"(bv*+ba/b)[filesize_approx<={limit_bytes}]/"
+        "bv*[height<=480]+ba/b[height<=480]/"
+        "bv*[height<=360]+ba/b[height<=360]/"
+        "b"
+    )
+
+# ===== Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ أهلاً! أرسل رابط أو ملف وسيتم تحميله.")
+    # أول /start: ترحيب + زر السناب؛ ثاني /start أو بعد الرجوع: التنبيه + طلب الرابط
+    if not context.user_data.get("welcomed"):
+        context.user_data["welcomed"] = True
+        await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown", reply_markup=snap_keyboard())
+    else:
+        await update.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📌 هذا بوت تحميل الوسائط.\nأرسل أي رابط وسأقوم بتنزيله.")
+    await update.message.reply_text(
+        "أرسل رابط فيديو/صورة من: YouTube / Instagram / X / Snapchat / TikTok.\n"
+        "سيتم الإرسال كفيديو/صورة فقط (بدون ملفات).",
+        reply_markup=snap_keyboard()
+    )
 
 async def snap_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("✅ تمت المعالجة!")
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
+    m = URL_RE.search(text)
+    if not m:
+        return
 
-    # مثال بسيط: لو أرسل رابط
-    if text.startswith("http"):
-        await update.message.reply_text("🔄 جاري المعالجة…")
-        # ممكن نضيف تحميل ملف هنا لاحقاً
-        await update.message.reply_text("✅ تم!")
+    url = m.group(1)
+    if not is_allowed(url):
+        await update.message.reply_text(
+            "❌ غير مدعوم. هذا البوت يدعم فقط: YouTube / Instagram / X / Snapchat / TikTok.",
+            reply_markup=snap_keyboard()
+        )
+        return
 
-    else:
-        await update.message.reply_text("أرسل رابط صحيح.")
+    await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
 
-# ───────────────────────────────────────────────
-# تشغيل البوت مع Flask بدون مشاكل Event Loop
-# ───────────────────────────────────────────────
+    try:
+        import yt_dlp
+    except Exception:
+        await update.message.reply_text("❌ مكتبة yt-dlp غير مثبتة.")
+        return
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+    last_error = None
+    sent_ok = False
 
-def run_bot_thread():
-    import asyncio
+    # نحاول عدة صيغ/حدود حتى نتمكّن من إرسال فيديو/صورة (بدون document وبدون روابط)
+    for limit in TARGET_SIZES + [None]:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            outtmpl = str(td_path / "%(title).80s.%(ext)s")
+            ydl_opts = {
+                "outtmpl": outtmpl,
+                "format": pick_format_for(limit),
+                "merge_output_format": "mp4",
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "restrictfilenames": True,
+                "nocheckcertificate": True,
+                "concurrent_fragment_downloads": 1,
+            }
 
+            info = None
+            file_path: Path | None = None
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if isinstance(info, dict):
+                        file_path = Path(info.get("_filename") or "")
+                    if not file_path or not file_path.exists():
+                        for p in td_path.iterdir():
+                            if p.is_file():
+                                file_path = p
+                                break
+            except Exception as e:
+                last_error = e
+                continue
+
+            if not file_path or not file_path.exists():
+                continue
+
+            title = (info.get("title") if isinstance(info, dict) else "الملف") or "الملف"
+            title = title[:990]
+            suffix = file_path.suffix.lower()
+
+            try:
+                if suffix in {".mp4", ".mov", ".mkv", ".webm"}:
+                    await update.message.reply_video(video=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
+                    sent_ok = True
+                    break
+                elif suffix in {".jpg", ".jpeg", ".png", ".gif"}:
+                    await update.message.reply_photo(photo=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
+                    sent_ok = True
+                    break
+                else:
+                    # صيغة غير مدعومة كوسائط — جرّب محاولة أصغر في الدورة القادمة
+                    last_error = Exception(f"Unsupported media type: {suffix}")
+                    continue
+            except Exception as e:
+                last_error = e
+                # جرّب حد أصغر في الدورة التالية
+                continue
+
+    if not sent_ok:
+        await update.message.reply_text(
+            "❌ تعذّر إرسال الوسائط تلقائيًا حتى بعد تخفيض الجودة.\n"
+            "جرّب فيديو أقصر/جودة أقل من نفس المنصة.",
+            reply_markup=snap_keyboard()
+        )
+        if last_error:
+            logging.exception("Send failed", exc_info=last_error)
+
+# ===== تشغيل تيليجرام (v21.6) في خيط مستقل مع asyncio.run =====
+async def run_bot_async():
     if not TOKEN:
-        raise RuntimeError("❌ لم يتم ضبط TELEGRAM_TOKEN في Render")
-
-    # بناء التطبيق (PTB v21+)
+        raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
     app_tg = Application.builder().token(TOKEN).build()
-
-    # إضافة الهاندلرز
     app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("help", help_cmd))
     app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
     app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-
-    # إنشاء EventLoop مستقل لهذا الخيط
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     print("✅ Telegram polling started")
-    loop.run_until_complete(app_tg.run_polling())
+    await app_tg.run_polling()  # v21+: دالة async
 
-# ───────────────────────────────────────────────
-# نقطة التشغيل
-# ───────────────────────────────────────────────
+def start_bot_thread():
+    asyncio.run(run_bot_async())
+
+# ===== نقطة التشغيل =====
 if __name__ == "__main__":
-    # تشغل البوت في الخلفية
-    Thread(target=run_bot_thread, daemon=True).start()
-
-    # Flask يشتغل كـ Web Service لـ Render
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    # نشغّل بوت تيليجرام في خيط منفصل (مع event loop خاص)
+    Thread(target=start_bot_thread, daemon=True).start()
+    # نشغّل Flask على الخيط الرئيسي لبقاء الخدمة حية على Render
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
