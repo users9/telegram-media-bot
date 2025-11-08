@@ -84,7 +84,6 @@ def pick_format_for(limit_bytes: int | None) -> str:
 
 # ===== Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # أول /start: ترحيب + زر السناب؛ ثاني /start أو بعد الرجوع: التنبيه + طلب الرابط
     if not context.user_data.get("welcomed"):
         context.user_data["welcomed"] = True
         await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown", reply_markup=snap_keyboard())
@@ -128,7 +127,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_error = None
     sent_ok = False
 
-    # نحاول عدة صيغ/حدود حتى نتمكّن من إرسال فيديو/صورة (بدون document وبدون روابط)
     for limit in TARGET_SIZES + [None]:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -179,12 +177,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     sent_ok = True
                     break
                 else:
-                    # صيغة غير مدعومة كوسائط — جرّب محاولة أصغر في الدورة القادمة
                     last_error = Exception(f"Unsupported media type: {suffix}")
                     continue
             except Exception as e:
                 last_error = e
-                # جرّب حد أصغر في الدورة التالية
                 continue
 
     if not sent_ok:
