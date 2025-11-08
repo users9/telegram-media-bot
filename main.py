@@ -1,9 +1,10 @@
-# main.py — PTB v21 + aiohttp (بدون ثريدات وبدون Flask)
+# main.py
 import os, re, tempfile, logging, asyncio
+from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
 
-from aiohttp import web
+from flask import Flask
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -11,13 +12,13 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# ===== إعدادات عامة =====
 logging.basicConfig(level=logging.INFO)
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # لا تحط كلمة bot هنا
-PORT = int(os.getenv("PORT", "10000"))
 
+# ===== الإعدادات =====
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 SNAP_URL = "https://snapchat.com/add/uckr"
 
+# المسموح: YouTube / Instagram / X / Snapchat / TikTok
 ALLOWED_HOSTS = {
     # YouTube
     "youtube.com", "www.youtube.com", "youtu.be",
@@ -28,17 +29,28 @@ ALLOWED_HOSTS = {
     # Instagram
     "instagram.com", "www.instagram.com",
     # TikTok
-    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com",
+    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com"
 }
 
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
 
-# ===== واجهة وأزرار =====
+# ===== Flask للـ Health Check (Render يحتاج بورت مفتوح) =====
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+# ===== الواجهة والأزرار =====
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
-        [InlineKeyboardButton("✅ تم، رجعت", callback_data="snap_back")],
+        [InlineKeyboardButton("✅ تم، رجعت", callback_data="snap_back")]
     ])
 
 WELCOME_MSG = (
@@ -51,10 +63,9 @@ NOTICE_MSG = (
     "⚠️ **تنبيه مهم:**\n"
     "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
     "رجاءً استخدمه في الخير فقط.\n\n"
-    "أرسل رابط الميديا من: YouTube / Instagram / X / Snapchat / TikTok."
+    "الآن أرسل رابط الميديا من: YouTube / Instagram / X / Snapchat / TikTok."
 )
 
-# ===== أدوات =====
 def is_allowed(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
@@ -89,9 +100,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def snap_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -120,7 +131,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for limit in TARGET_SIZES + [None]:
         with tempfile.TemporaryDirectory() as td:
-            outtmpl = str(Path(td) / "%(title).80s.%(ext)s")
+            td_path = Path(td)
+            outtmpl = str(td_path / "%(title).80s.%(ext)s")
             ydl_opts = {
                 "outtmpl": outtmpl,
                 "format": pick_format_for(limit),
@@ -140,14 +152,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     if isinstance(info, dict):
-                        maybe = info.get("_filename")
-                        if maybe:
-                            p = Path(maybe)
-                            if p.exists():
-                                file_path = p
-                    if not file_path:
-                        # التقط أي ملف تم تنزيله
-                        for p in Path(td).iterdir():
+                        file_path = Path(info.get("_filename") or "")
+                    if not file_path or not file_path.exists():
+                        for p in td_path.iterdir():
                             if p.is_file():
                                 file_path = p
                                 break
@@ -180,56 +187,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not sent_ok:
         await update.message.reply_text(
-            "❌ تعذّر إرسال الوسائط حتى بعد تخفيض الجودة.\n"
-            "جرّب فيديو أقصر/جودة أقل.",
+            "❌ تعذّر إرسال الوسائط تلقائيًا حتى بعد تخفيض الجودة.\n"
+            "جرّب فيديو أقصر/جودة أقل من نفس المنصة.",
             reply_markup=snap_keyboard()
         )
         if last_error:
             logging.exception("Send failed", exc_info=last_error)
 
-# ===== تشغيل PTB + الويب معًا (aiohttp) =====
-async def start_http_server():
-    async def health(request):
-        return web.Response(text="Bot is running!")
-    app_http = web.Application()
-    app_http.router.add_get("/", health)
-    runner = web.AppRunner(app_http)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logging.info(f"🌐 HTTP server on 0.0.0.0:{PORT}")
-
-async def main():
+# ===== تشغيل البوت (PTB v21 بطريقة صحيحة) =====
+def build_app() -> Application:
     if not TOKEN:
-        raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment Variables.")
+        raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
+    app_tg = Application.builder().token(TOKEN).build()
+    app_tg.add_handler(CommandHandler("start", start))
+    app_tg.add_handler(CommandHandler("help", help_cmd))
+    app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
+    app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    return app_tg
 
-    application = Application.builder().token(TOKEN).build()
+async def run_bot():
+    app_tg = build_app()
 
-    # أوامر وهاندلرز
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    # تأكيد أن التوكن يعمل + حذف أي Webhook
+    me = await app_tg.bot.get_me()
+    logging.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
+    await app_tg.bot.delete_webhook(drop_pending_updates=True)
 
-    # شغّل HTTP (صحة) + البوت معًا بدون ثريدات
-    await start_http_server()
-
-    # احذف أي Webhook، ثم ابدأ Polling
-    await application.bot.delete_webhook(drop_pending_updates=True)
-
-    # تشغيل يدوي متوافق مع v21 داخل نفس الـ loop
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    logging.info("✅ Telegram polling started")
-
-    # أبقِ السيرفس شغّالة
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+    # ملاحظة مهمة: نخلي PTB يدير اللوب، ونمنع إغلاقه (close_loop=False) لمنع أخطاء Render
+    # ونلغي إشارات النظام (stop_signals=None) لتفادي مشاكل الثريدات.
+    await app_tg.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        stop_signals=None,
+        close_loop=False,
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # شغّل Flask في ثريد جانبي (للـ Health Check)
+    Thread(target=run_flask, daemon=True).start()
+    # وشغّل بوت تيليجرام في الـ main thread بشكل async
+    asyncio.run(run_bot())
