@@ -1,4 +1,4 @@
-# main.py (متوافق مع python-telegram-bot==21.6)
+# main.py  — يعمل مع python-telegram-bot==21.6
 import os, re, tempfile, logging, asyncio
 from threading import Thread
 from pathlib import Path
@@ -20,17 +20,13 @@ SNAP_URL = "https://snapchat.com/add/uckr"
 
 # المنصات المسموحة
 ALLOWED_HOSTS = {
-    # YouTube
     "youtube.com", "www.youtube.com", "youtu.be",
-    # X (Twitter)
     "twitter.com", "www.twitter.com", "x.com", "www.x.com",
-    # Snapchat
     "snapchat.com", "www.snapchat.com", "story.snapchat.com",
-    # Instagram
     "instagram.com", "www.instagram.com",
-    # TikTok
     "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com"
 }
+
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
 
@@ -41,11 +37,12 @@ app = Flask(__name__)
 def home():
     return "Bot is running!"
 
-def run_flask():
-    port = int(os.getenv("PORT", 10000))
+def start_flask():
+    port = int(os.getenv("PORT", "10000"))
+    # تشغيل Flask في خيط ثانوي، والخيط الرئيسي للبوت
     app.run(host="0.0.0.0", port=port)
 
-# ===== واجهة وأزرار =====
+# ===== الواجهة والأزرار =====
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
@@ -62,7 +59,7 @@ NOTICE_MSG = (
     "⚠️ **تنبيه مهم:**\n"
     "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
     "رجاءً استخدمه في الخير فقط.\n\n"
-    "الآن أرسل رابط الميديا من: YouTube / Instagram / X / Snapchat / TikTok."
+    "أرسل رابط من: YouTube / Instagram / X / Snapchat / TikTok."
 )
 
 def is_allowed(url: str) -> bool:
@@ -84,7 +81,7 @@ def pick_format_for(limit_bytes: int | None) -> str:
     )
 
 # ===== Handlers =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("welcomed"):
         context.user_data["welcomed"] = True
         await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown", reply_markup=snap_keyboard())
@@ -94,14 +91,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أرسل رابط فيديو/صورة من: YouTube / Instagram / X / Snapchat / TikTok.\n"
-        "سيتم الإرسال كفيديو/صورة فقط (بدون ملفات).",
+        "الإرسال سيكون كفيديو/صورة فقط (بدون ملفات).",
         reply_markup=snap_keyboard()
     )
 
 async def snap_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -112,7 +109,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = m.group(1)
     if not is_allowed(url):
         await update.message.reply_text(
-            "❌ غير مدعوم. هذا البوت يدعم فقط: YouTube / Instagram / X / Snapchat / TikTok.",
+            "❌ غير مدعوم. المسموح: YouTube / Instagram / X / Snapchat / TikTok.",
             reply_markup=snap_keyboard()
         )
         return
@@ -128,7 +125,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_error = None
     sent_ok = False
 
-    # محاولات متعددة لاختيار صيغة/حجم مناسب للإرسال كوسائط
     for limit in TARGET_SIZES + [None]:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -144,7 +140,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "nocheckcertificate": True,
                 "concurrent_fragment_downloads": 1,
             }
-
             info = None
             file_path: Path | None = None
 
@@ -187,45 +182,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not sent_ok:
         await update.message.reply_text(
-            "❌ تعذّر إرسال الوسائط تلقائيًا حتى بعد تخفيض الجودة.\n"
-            "جرّب فيديو أقصر/جودة أقل من نفس المنصة.",
+            "❌ تعذّر إرسال الوسائط حتى بعد تخفيض الجودة. جرّب جودة أقل/فيديو أقصر.",
             reply_markup=snap_keyboard()
         )
         if last_error:
             logging.exception("Send failed", exc_info=last_error)
 
-# ===== تشغيل البوت (v21 الطريقة الصحيحة بدون مشاكل إشارات) =====
-async def build_app():
+# ===== تشغيل البوت (v21.6) =====
+async def build_app() -> Application:
     if not TOKEN:
         raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
-
     app_tg = Application.builder().token(TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", start))
+
+    app_tg.add_handler(CommandHandler("start", start_cmd))
     app_tg.add_handler(CommandHandler("help", help_cmd))
     app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
     app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
-    async def _probe(_app):
-        me = await _app.bot.get_me()
+    # فحص سريع + حذف أي Webhook
+    async def _post_init(application: Application):
+        me = await application.bot.get_me()
         print(f"✅ BOT OK: @{me.username} (id={me.id})")
-    app_tg.post_init = _probe
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            print(f"Webhook delete warn: {e}")
 
+    app_tg.post_init = _post_init
     return app_tg
 
 async def run_bot():
     app_tg = await build_app()
-
-    # نبدأ Flask في خيط جانبي
-    Thread(target=run_flask, daemon=True).start()
-
-    # تسلسل v21 بدون run_polling لتفادي الإشارات:
-    await app_tg.initialize()
-    await app_tg.start()
-    print("✅ Telegram polling started")
-    await app_tg.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    await app_tg.updater.wait_closed()
-    await app_tg.stop()
-    await app_tg.shutdown()
+    # مهم: بدون إشارات (stop_signals=None) لأننا بالخيط الرئيسي مع Flask في خيط آخر
+    await app_tg.run_polling(stop_signals=None, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+    # شغّل Flask في خيط ثانوي (لـ Render health check)
+    Thread(target=start_flask, daemon=True).start()
+    # شغّل البوت في الخيط الرئيسي (لا تضعه داخل Thread لتفادي مشاكل الإشارات)
     asyncio.run(run_bot())
