@@ -1,7 +1,9 @@
+# main.py — PTB v21.6 + Flask healthcheck (Render-friendly)
+
 import os, re, tempfile, logging
+from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
-from threading import Thread
 
 from flask import Flask
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,31 +14,42 @@ from telegram.ext import (
 )
 
 logging.basicConfig(level=logging.INFO)
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+log = logging.getLogger(__name__)
+
+# ===== الإعدادات =====
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # لا تضع كلمة bot هنا
 SNAP_URL = "https://snapchat.com/add/uckr"
 
+# المنصات المسموحة
 ALLOWED_HOSTS = {
-    "youtube.com","www.youtube.com","youtu.be",
-    "twitter.com","www.twitter.com","x.com","www.x.com",
-    "snapchat.com","www.snapchat.com","story.snapchat.com",
-    "instagram.com","www.instagram.com",
-    "tiktok.com","www.tiktok.com","vm.tiktok.com","m.tiktok.com"
+    # YouTube
+    "youtube.com", "www.youtube.com", "youtu.be",
+    # X (Twitter)
+    "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+    # Snapchat
+    "snapchat.com", "www.snapchat.com", "story.snapchat.com",
+    # Instagram
+    "instagram.com", "www.instagram.com",
+    # TikTok
+    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com"
 }
 
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
 
-app = Flask(__name__)
+# ===== Flask للـ Health Check =====
+flask_app = Flask(__name__)
 
-@app.route("/")
+@flask_app.route("/")
 def home():
     return "Bot is running!"
 
-def start_health_server():
+def run_flask():
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    flask_app.run(host="0.0.0.0", port=port)
 
-def snap_keyboard():
+# ===== الواجهة والأزرار =====
+def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
         [InlineKeyboardButton("✅ تم، رجعت", callback_data="snap_back")]
@@ -48,7 +61,6 @@ WELCOME_MSG = (
     f"🔗 {SNAP_URL}\n\n"
     "بعد الإضافة، ارجع واضغط **تم، رجعت** أو أرسل **/start** مرة ثانية."
 )
-
 NOTICE_MSG = (
     "⚠️ **تنبيه مهم:**\n"
     "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
@@ -60,10 +72,10 @@ def is_allowed(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
         return host in ALLOWED_HOSTS
-    except:
+    except Exception:
         return False
 
-def pick_format_for(limit_bytes):
+def pick_format_for(limit_bytes: int | None) -> str:
     if limit_bytes is None:
         return "bv*+ba/best"
     return (
@@ -74,7 +86,8 @@ def pick_format_for(limit_bytes):
         "b"
     )
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== Handlers =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("welcomed"):
         context.user_data["welcomed"] = True
         await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown", reply_markup=snap_keyboard())
@@ -83,107 +96,133 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أرسل رابط فيديو/صورة من: YouTube / Instagram / X / Snapchat / TikTok.",
+        "أرسل رابط فيديو/صورة من: YouTube / Instagram / X / Snapchat / TikTok.\n"
+        "سيتم الإرسال كفيديو/صورة فقط (بدون ملفات).",
         reply_markup=snap_keyboard()
     )
 
 async def snap_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
+    text = (update.message.text or "").strip()
     m = URL_RE.search(text)
     if not m:
         return
 
     url = m.group(1)
     if not is_allowed(url):
-        await update.message.reply_text("❌ غير مدعوم.", reply_markup=snap_keyboard())
+        await update.message.reply_text(
+            "❌ غير مدعوم. هذا البوت يدعم فقط: YouTube / Instagram / X / Snapchat / TikTok.",
+            reply_markup=snap_keyboard()
+        )
         return
 
     await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
 
     try:
         import yt_dlp
-    except:
+    except Exception:
         await update.message.reply_text("❌ مكتبة yt-dlp غير مثبتة.")
         return
 
     last_error = None
-    sent = False
+    sent_ok = False
 
     for limit in TARGET_SIZES + [None]:
         with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            outtmpl = str(td / "%(title).80s.%(ext)s")
-            opts = {
-                "format": pick_format_for(limit),
+            td_path = Path(td)
+            outtmpl = str(td_path / "%(title).80s.%(ext)s")
+            ydl_opts = {
                 "outtmpl": outtmpl,
+                "format": pick_format_for(limit),
                 "merge_output_format": "mp4",
                 "noplaylist": True,
                 "quiet": True,
-                "no_warnings": True
+                "no_warnings": True,
+                "restrictfilenames": True,
+                "nocheckcertificate": True,
+                "concurrent_fragment_downloads": 1,
             }
+
             info = None
-            fpath = None
+            file_path: Path | None = None
+
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
-                    f = info.get("_filename")
-                    fpath = Path(f) if f else None
+                    if isinstance(info, dict):
+                        file_path = Path(info.get("_filename") or "")
+                    if not file_path or not file_path.exists():
+                        for p in td_path.iterdir():
+                            if p.is_file():
+                                file_path = p
+                                break
             except Exception as e:
                 last_error = e
                 continue
 
-            if not fpath or not fpath.exists():
+            if not file_path or not file_path.exists():
                 continue
 
-            ext = fpath.suffix.lower()
-            title = info.get("title")[:990] if info else "الملف"
+            title = (info.get("title") if isinstance(info, dict) else "الملف") or "الملف"
+            title = title[:990]
+            suffix = file_path.suffix.lower()
 
             try:
-                if ext in {".mp4", ".mov", ".mkv", ".webm"}:
-                    await update.message.reply_video(fpath.open("rb"), caption=title, reply_markup=snap_keyboard())
+                if suffix in {".mp4", ".mov", ".mkv", ".webm"}:
+                    await update.message.reply_video(video=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
+                    sent_ok = True
+                    break
+                elif suffix in {".jpg", ".jpeg", ".png", ".gif"}:
+                    await update.message.reply_photo(photo=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
+                    sent_ok = True
+                    break
                 else:
-                    await update.message.reply_photo(fpath.open("rb"), caption=title, reply_markup=snap_keyboard())
-                sent = True
-                break
+                    last_error = Exception(f"Unsupported media type: {suffix}")
+                    continue
             except Exception as e:
                 last_error = e
                 continue
 
-    if not sent:
-        await update.message.reply_text("❌ تعذّر إرسال الوسائط.", reply_markup=snap_keyboard())
+    if not sent_ok:
+        await update.message.reply_text(
+            "❌ تعذّر إرسال الوسائط تلقائيًا حتى بعد تخفيض الجودة.\n"
+            "جرّب فيديو أقصر/جودة أقل من نفس المنصة.",
+            reply_markup=snap_keyboard()
+        )
+        if last_error:
+            log.exception("Send failed", exc_info=last_error)
 
-def build_app():
+# ===== تهيئة التطبيق (v21.6) =====
+async def on_startup(app: Application):
+    me = await app.bot.get_me()
+    log.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
+    # نحذف أي Webhook عالق لأننا نستخدم polling
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=False)
+    except Exception as e:
+        log.warning("delete_webhook failed: %s", e)
+
+def build_app() -> Application:
     if not TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN not set")
+        raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
     app_tg = Application.builder().token(TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", start_cmd))
+    app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("help", help_cmd))
     app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
-    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    app_tg.post_init = on_startup
     return app_tg
 
-def main():
-    Thread(target=start_health_server, daemon=True).start()
-
-    import asyncio
-    app_tg = build_app()
-
-    async def boot():
-        me = await app_tg.bot.get_me()
-        logging.info(f"✅ Logged in as @{me.username} (id={me.id})")
-        try:
-            await app_tg.bot.delete_webhook(drop_pending_updates=False)
-        except:
-            pass
-        logging.info("✅ Telegram polling started")
-        app_tg.run_polling(allowed_updates=Update.ALL_TYPES)
-
-    asyncio.run(boot())
-
+# ===== نقطة التشغيل =====
 if __name__ == "__main__":
-    main()
+    # شغّل Flask في الخلفية
+    Thread(target=run_flask, daemon=True).start()
+
+    # شغّل Telegram polling في الخيط الرئيسي (مهم لتفادي مشاكل الحدث)
+    application = build_app()
+    # ملاحظة: لا تستخدم asyncio.run هنا، ولا تشغّل polling داخل ثريد آخر.
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
