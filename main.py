@@ -1,5 +1,8 @@
-# main.py  — يعمل مع python-telegram-bot==21.6
-import os, re, tempfile, logging, asyncio
+# main.py
+import os
+import re
+import tempfile
+import logging
 from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
@@ -12,37 +15,43 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
+# =============== إعداد اللوج ===============
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
 
-# ===== الإعدادات =====
+# =============== الإعدادات ===============
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 SNAP_URL = "https://snapchat.com/add/uckr"
+URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 
-# المنصات المسموحة
 ALLOWED_HOSTS = {
+    # YouTube
     "youtube.com", "www.youtube.com", "youtu.be",
+    # X (Twitter)
     "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+    # Snapchat
     "snapchat.com", "www.snapchat.com", "story.snapchat.com",
+    # Instagram
     "instagram.com", "www.instagram.com",
+    # TikTok
     "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com"
 }
 
-URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
+# محاولات لتقليل الحجم لضمان الإرسال كصورة/فيديو
 TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
 
-# ===== Flask للـ Health Check =====
+# =============== Flask للـ Health Check ===============
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running!"
+    return "OK - bot alive"
 
-def start_flask():
-    port = int(os.getenv("PORT", "10000"))
-    # تشغيل Flask في خيط ثانوي، والخيط الرئيسي للبوت
-    app.run(host="0.0.0.0", port=port)
+# نشغّل Flask في خيط جانبي
+def run_health_server():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=False, use_reloader=False)
 
-# ===== الواجهة والأزرار =====
+# =============== واجهة الأزرار والرسائل ===============
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
@@ -59,7 +68,7 @@ NOTICE_MSG = (
     "⚠️ **تنبيه مهم:**\n"
     "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
     "رجاءً استخدمه في الخير فقط.\n\n"
-    "أرسل رابط من: YouTube / Instagram / X / Snapchat / TikTok."
+    "أرسل الآن رابط الميديا من: YouTube / Instagram / X / Snapchat / TikTok."
 )
 
 def is_allowed(url: str) -> bool:
@@ -69,7 +78,7 @@ def is_allowed(url: str) -> bool:
     except Exception:
         return False
 
-def pick_format_for(limit_bytes: int | None) -> str:
+def fmt_for_limit(limit_bytes: int | None) -> str:
     if limit_bytes is None:
         return "bv*+ba/best"
     return (
@@ -80,18 +89,18 @@ def pick_format_for(limit_bytes: int | None) -> str:
         "b"
     )
 
-# ===== Handlers =====
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =============== Handlers ===============
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("welcomed"):
         context.user_data["welcomed"] = True
         await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown", reply_markup=snap_keyboard())
     else:
         await update.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أرسل رابط فيديو/صورة من: YouTube / Instagram / X / Snapchat / TikTok.\n"
-        "الإرسال سيكون كفيديو/صورة فقط (بدون ملفات).",
+        "الإرسال دائمًا كفيديو/صورة فقط.",
         reply_markup=snap_keyboard()
     )
 
@@ -109,7 +118,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = m.group(1)
     if not is_allowed(url):
         await update.message.reply_text(
-            "❌ غير مدعوم. المسموح: YouTube / Instagram / X / Snapchat / TikTok.",
+            "❌ غير مدعوم. يدعم فقط: YouTube / Instagram / X / Snapchat / TikTok.",
             reply_markup=snap_keyboard()
         )
         return
@@ -131,7 +140,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             outtmpl = str(td_path / "%(title).80s.%(ext)s")
             ydl_opts = {
                 "outtmpl": outtmpl,
-                "format": pick_format_for(limit),
+                "format": fmt_for_limit(limit),
                 "merge_output_format": "mp4",
                 "noplaylist": True,
                 "quiet": True,
@@ -140,6 +149,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "nocheckcertificate": True,
                 "concurrent_fragment_downloads": 1,
             }
+
             info = None
             file_path: Path | None = None
 
@@ -174,6 +184,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     sent_ok = True
                     break
                 else:
+                    # غير مدعوم كوسائط — جرّب دورة أصغر
                     last_error = Exception(f"Unsupported media type: {suffix}")
                     continue
             except Exception as e:
@@ -182,42 +193,47 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not sent_ok:
         await update.message.reply_text(
-            "❌ تعذّر إرسال الوسائط حتى بعد تخفيض الجودة. جرّب جودة أقل/فيديو أقصر.",
+            "❌ تعذّر إرسال الوسائط حتى بعد تخفيض الجودة.\n"
+            "جرّب فيديو أقصر/جودة أقل.",
             reply_markup=snap_keyboard()
         )
         if last_error:
-            logging.exception("Send failed", exc_info=last_error)
+            log.exception("Send failed", exc_info=last_error)
 
-# ===== تشغيل البوت (v21.6) =====
-async def build_app() -> Application:
+def build_bot() -> Application:
     if not TOKEN:
         raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
     app_tg = Application.builder().token(TOKEN).build()
 
-    app_tg.add_handler(CommandHandler("start", start_cmd))
-    app_tg.add_handler(CommandHandler("help", help_cmd))
+    # حذف أي Webhook لأننا نستخدم Polling
+    async def on_start(app_: Application):
+        try:
+            me = await app_.bot.get_me()
+            log.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
+            await app_.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            log.warning("Couldn't delete webhook: %s", e)
+
+    app_tg.post_init = on_start
+
+    app_tg.add_handler(CommandHandler("start", cmd_start))
+    app_tg.add_handler(CommandHandler("help", cmd_help))
     app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
     app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-
-    # فحص سريع + حذف أي Webhook
-    async def _post_init(application: Application):
-        me = await application.bot.get_me()
-        print(f"✅ BOT OK: @{me.username} (id={me.id})")
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e:
-            print(f"Webhook delete warn: {e}")
-
-    app_tg.post_init = _post_init
     return app_tg
 
-async def run_bot():
-    app_tg = await build_app()
-    # مهم: بدون إشارات (stop_signals=None) لأننا بالخيط الرئيسي مع Flask في خيط آخر
-    await app_tg.run_polling(stop_signals=None, allowed_updates=Update.ALL_TYPES)
+def main():
+    # شغّل Flask في خيط جانبي
+    Thread(target=run_health_server, daemon=True).start()
+
+    # شغّل بوت تيليجرام في الخيط الرئيسي (لا تستخدم asyncio.run هنا)
+    app_tg = build_bot()
+    log.info("✅ Telegram polling starting ...")
+    # مهم: لا نمرر stop_signals في بيئات Thread — لكننا في الخيط الرئيسي الآن
+    app_tg.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False  # تحاشي مشاكل إغلاق اللووب على بعض البيئات
+    )
 
 if __name__ == "__main__":
-    # شغّل Flask في خيط ثانوي (لـ Render health check)
-    Thread(target=start_flask, daemon=True).start()
-    # شغّل البوت في الخيط الرئيسي (لا تضعه داخل Thread لتفادي مشاكل الإشارات)
-    asyncio.run(run_bot())
+    main()
