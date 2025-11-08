@@ -1,5 +1,5 @@
 # main.py
-import os, re, tempfile, logging
+import os, re, tempfile, logging, asyncio
 from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,33 +18,25 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 SNAP_URL = "https://snapchat.com/add/uckr"
 
-# المسموح: YouTube / Instagram / X / Snapchat / TikTok
 ALLOWED_HOSTS = {
-    # YouTube
     "youtube.com", "www.youtube.com", "youtu.be",
-    # X (Twitter)
     "twitter.com", "www.twitter.com", "x.com", "www.x.com",
-    # Snapchat
     "snapchat.com", "www.snapchat.com", "story.snapchat.com",
-    # Instagram
     "instagram.com", "www.instagram.com",
-    # TikTok
     "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "m.tiktok.com"
 }
 
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
-
-# نحاول أحجام أقل تدريجيًا لنضمن الإرسال كـ فيديو/صورة فقط
 TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
 
-# ===== Flask للـ Health Check =====
+# ===== Flask Health Check =====
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot is running!"
 
-# ===== الواجهة والأزرار =====
+# ===== UI =====
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
@@ -93,7 +85,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أرسل رابط فيديو/صورة من: YouTube / Instagram / X / Snapchat / TikTok.\n"
-        "سيتم الإرسال كفيديو/صورة فقط (بدون ملفات).",
+        "سيتم الإرسال كفيديو/صورة فقط.",
         reply_markup=snap_keyboard()
     )
 
@@ -107,11 +99,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = URL_RE.search(text)
     if not m:
         return
-
     url = m.group(1)
     if not is_allowed(url):
         await update.message.reply_text(
-            "❌ غير مدعوم. هذا البوت يدعم فقط: YouTube / Instagram / X / Snapchat / TikTok.",
+            "❌ غير مدعوم. يدعم فقط: YouTube / Instagram / X / Snapchat / TikTok.",
             reply_markup=snap_keyboard()
         )
         return
@@ -145,7 +136,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             info = None
             file_path: Path | None = None
-
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -186,13 +176,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not sent_ok:
         await update.message.reply_text(
             "❌ تعذّر إرسال الوسائط تلقائيًا حتى بعد تخفيض الجودة.\n"
-            "جرّب فيديو أقصر/جودة أقل من نفس المنصة.",
+            "جرّب فيديو أقصر/جودة أقل.",
             reply_markup=snap_keyboard()
         )
         if last_error:
             logging.exception("Send failed", exc_info=last_error)
 
-def start_bot():
+# ===== بوت تيليجرام (async) =====
+async def run_bot():
     if not TOKEN:
         raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
     app_tg = Application.builder().token(TOKEN).build()
@@ -201,8 +192,12 @@ def start_bot():
     app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
     app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     print("✅ Telegram polling started")
-    app_tg.run_polling()
+    await app_tg.run_polling()  # v21+: لازم داخل asyncio
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
 
 if __name__ == "__main__":
-    Thread(target=start_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    # شغّل Flask في ثريد جانبي، والبوت في الـmain event loop
+    Thread(target=run_flask, daemon=True).start()
+    asyncio.run(run_bot())
