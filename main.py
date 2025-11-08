@@ -35,16 +35,12 @@ ALLOWED_HOSTS = {
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
 
-# ===== Flask للـ Health Check (Render يحتاج بورت مفتوح) =====
+# ===== Flask للـ Health Check =====
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot is running!"
-
-def run_flask():
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
 
 # ===== الواجهة والأزرار =====
 def snap_keyboard() -> InlineKeyboardMarkup:
@@ -194,35 +190,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if last_error:
             logging.exception("Send failed", exc_info=last_error)
 
-# ===== تشغيل البوت (PTB v21 بطريقة صحيحة) =====
-def build_app() -> Application:
+# ===== تشغيل البوت داخل ثريد مستقل مع لوب خاص =====
+def start_bot_thread():
     if not TOKEN:
         raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
-    app_tg = Application.builder().token(TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", start))
-    app_tg.add_handler(CommandHandler("help", help_cmd))
-    app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
-    app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-    return app_tg
 
-async def run_bot():
-    app_tg = build_app()
+    def runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-    # تأكيد أن التوكن يعمل + حذف أي Webhook
-    me = await app_tg.bot.get_me()
-    logging.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
-    await app_tg.bot.delete_webhook(drop_pending_updates=True)
+        app_tg = Application.builder().token(TOKEN).build()
+        app_tg.add_handler(CommandHandler("start", start))
+        app_tg.add_handler(CommandHandler("help", help_cmd))
+        app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
+        app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
-    # ملاحظة مهمة: نخلي PTB يدير اللوب، ونمنع إغلاقه (close_loop=False) لمنع أخطاء Render
-    # ونلغي إشارات النظام (stop_signals=None) لتفادي مشاكل الثريدات.
-    await app_tg.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        stop_signals=None,
-        close_loop=False,
-    )
+        async def main():
+            # تأكد من إلغاء أي Webhook (نستخدم polling)
+            try:
+                await app_tg.bot.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                logging.warning(f"delete_webhook warning: {e}")
 
+            me = await app_tg.bot.get_me()
+            logging.info(f"✅ Logged in as @{me.username} (id={me.id})")
+
+            # مهم: بدون signals في الثريد + خليك على نفس اللوب
+            await app_tg.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                stop_signals=None  # لا تسجل سيجنال في ثريد
+            )
+
+        loop.run_until_complete(main())
+        loop.close()
+
+    Thread(target=runner, daemon=True).start()
+
+# ===== Main =====
 if __name__ == "__main__":
-    # شغّل Flask في ثريد جانبي (للـ Health Check)
-    Thread(target=run_flask, daemon=True).start()
-    # وشغّل بوت تيليجرام في الـ main thread بشكل async
-    asyncio.run(run_bot())
+    # شغّل البوت بالخلفية
+    start_bot_thread()
+    # شغّل Flask للـ health check
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
