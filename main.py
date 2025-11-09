@@ -1,162 +1,184 @@
-# main.py — Telegram media downloader (sends as Document)
-import os, re, asyncio, logging, tempfile, shutil
+# main.py
+import os, re, logging, tempfile, asyncio, threading
 from pathlib import Path
-from threading import Thread
 
-from flask import Flask
-from telegram import Update, InputFile
+from flask import Flask, jsonify
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+)
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 import yt_dlp
 
-# ====== إعدادات عامة ======
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
+# ========= إعدادات عامة =========
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # ضع التوكن في Render Env Var فقط
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # لا تكتب التوكن صريح، خله من المتغير
 if not TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN not set!")
+    raise RuntimeError("متغير البيئة TELEGRAM_TOKEN غير موجود")
 
-# ====== Flask للـ health check على Render ======
-app = Flask(__name__)
+# سناب شات حقّك
+SNAP_URL = "https://www.snapchat.com/add/uckr"
 
-@app.get("/")
+# ========= أزرار ورسائل =========
+def snap_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
+        [InlineKeyboardButton("✅ تم، رجعت", callback_data="snap_back")]
+    ])
+
+WELCOME_MSG = (
+    "👋 **مرحبًا!**\n\n"
+    f"قبل ما نبدأ… ياليت تضيفني على السناب:\n🔗 {SNAP_URL}\n\n"
+    "بعد الإضافة ارجع واضغط **تم، رجعت** أو أرسل **/start** مرة ثانية."
+)
+NOTICE_MSG = (
+    "⚠️ **تنبيه مهم:**\n"
+    "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
+    "رجاءً استخدمه في الخير فقط.\n\n"
+    "أرسل رابط من: YouTube / Instagram / X / Snapchat / TikTok."
+)
+
+# ========= Flask (لـ Render) =========
+web = Flask(__name__)
+
+@web.get("/")
 def root():
-    return "OK", 200
+    return jsonify(ok=True, msg="telegram-media-bot is live")
 
 def run_flask():
     port = int(os.getenv("PORT", "10000"))
-    # تشغيل Flask في ثريد جانبي عشان ما يعطل البوت
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    web.run(host="0.0.0.0", port=port, debug=False)
 
-# ====== أدوات ======
-URL_RE = re.compile(r"https?://\S+", re.I)
+# ========= أدوات مساعدة =========
+URL_RGX = re.compile(r"https?://\S+", re.I)
 
-YDL_OPTS = {
-    # أفضل جودة ممكنة بدون إنقاص
-    "format": "bv*+ba/best",
-    "merge_output_format": "mp4",
-    "noplaylist": True,
-    "restrictfilenames": True,
-    "outtmpl": "%(title).200s.%(ext)s",
-    "concurrent_fragment_downloads": 8,
-    "quiet": True,
-    "no_warnings": True,
-    # مفيد لبعض المواقع
-    "http_headers": {"User-Agent": "Mozilla/5.0"},
-    # لا تستخدم الكوكيز (بعض المواقع قد ترفض بدون تسجيل دخول)
-    # لو احتجته لاحقاً نضيفه اختياري.
-}
+def normalize_url(url: str) -> str:
+    url = url.strip()
 
-MAX_TG_FILE = 2 * 1024 * 1024 * 1024  # حد تيليجرام 2GB
+    # دعم vt.tiktok.com المختصر
+    if "vt.tiktok.com" in url:
+        # yt-dlp يحله مباشرة، بس نتأكد أن البروتوكول مضبوط
+        if not url.startswith("http"):
+            url = "https://" + url
 
-async def send_as_document(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path: Path, caption: str):
-    size = file_path.stat().st_size
-    if size >= MAX_TG_FILE:
-        await update.effective_chat.send_message(
-            f"⚠️ حجم الملف {size/1024/1024:.1f} MB أكبر من حد تيليجرام (2GB). جرّب رابط بجودة أقل."
-        )
-        return
-    with file_path.open("rb") as f:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=InputFile(f, filename=file_path.name),
-            caption=caption[:1024]
-        )
+    # تنظيف روابط تيك توك/انستا المعقّدة جدًا
+    if "tiktok.com" in url and "?_" in url:
+        url = url.split("?")[0]
+    if "instagram.com" in url and "?__" in url:
+        url = url.split("?")[0]
 
-def sanitize_title(title: str) -> str:
-    return re.sub(r"[\\/:*?\"<>|]+", "_", title).strip() or "video"
+    return url
 
-# ====== Handlers ======
-async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "أهلًا! أرسل أي رابط فيديو (تيك توك/يوتيوب/تويتر/إنستقرام…)\n"
-        "سأحاول تحميله وإرساله لك **كملف (Document)** بدون تقليل جودة 🎬"
-    )
+def ytdlp_opts(temp_dir: Path) -> dict:
+    out = str(temp_dir / "%(title).200B-%(id)s.%(ext)s")
+    return {
+        # أعلى جودة متاحة بدون تخفيض
+        "format": "bestvideo*+bestaudio/best",
+        "merge_output_format": "mp4",
+        "outtmpl": out,
+        "noplaylist": True,
+        "quiet": True,
+        "concurrent_fragments": 8,
+        "retries": 5,
+        "fragment_retries": 5,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        # لا نستخدم كوكيز (مثل ما طلبت)
+        "cookiesfrombrowser": None,
+    }
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.effective_message.text or ""
-    m = URL_RE.search(text)
-    if not m:
-        return  # تجاهل أي رسالة بدون رابط
-
-    url = m.group(0).strip()
-
-    # دعم روابط تيك توك الحديثة vt.tiktok.com
-    if "vt.tiktok.com" in url and not url.endswith("/"):
-        url += "/"  # بعض الروابط تحتاج سلاش أخير
-
-    await update.effective_chat.send_message("⏳ جاري التحميل…")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        opts = dict(YDL_OPTS)
-        opts["outtmpl"] = str(tmp / "%(title).200s.%(ext)s")
-
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                # استخرج المسار الفعلي للملف الناتج
-                if "_filename" in info:
-                    out = Path(info["_filename"])
-                else:
-                    title = sanitize_title(info.get("title") or "video")
-                    ext = info.get("ext") or "mp4"
-                    out = tmp / f"{title}.{ext}"
-
-            if not out.exists():
-                # أحيانًا يكون المسار النهائي عبر entries
-                entries = info.get("entries") or []
-                for it in entries:
-                    if it.get("_filename"):
-                        out = Path(it["_filename"])
-                        if out.exists():
-                            break
-
-            if not out.exists():
-                raise FileNotFoundError("لم أجد الملف الناتج بعد التحميل.")
-
-            await send_as_document(update, context, out, caption=info.get("title") or "")
-
-        except yt_dlp.utils.DownloadError as e:
-            msg = str(e)
-            # رسائل ودّية لأشهر المشاكل
-            if "login required" in msg.lower() or "rate-limit" in msg.lower() or "private" in msg.lower():
-                await update.effective_chat.send_message(
-                    "❌ المنصّة تطلب تسجيل دخول أو تجاوز حد الاستخدام. بدون كوكيز قد يرفض الموقع.\n"
-                    "جرّب رابط آخر أو منصة أخرى."
-                )
+def download_media(url: str) -> Path:
+    url = normalize_url(url)
+    with tempfile.TemporaryDirectory() as td:
+        temp_dir = Path(td)
+        with yt_dlp.YoutubeDL(ytdlp_opts(temp_dir)) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if "requested_downloads" in info and info["requested_downloads"]:
+                filepath = info["requested_downloads"][0]["filepath"]
             else:
-                await update.effective_chat.send_message(f"❌ فشل التحميل:\n{msg[:900]}")
-            log.exception("Download error")
-        except Exception as e:
-            await update.effective_chat.send_message(f"❌ صار خطأ غير متوقع.")
-            log.exception("Unexpected error: %s", e)
+                filepath = ydl.prepare_filename(info)
+        return Path(filepath).resolve()
 
-# ====== تشغيل البوت و Flask ======
-def build_app() -> Application:
-    app_tg = Application.builder().token(TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", cmd_start))
-    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    return app_tg
+# ========= Handlers =========
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(WELCOME_MSG, reply_markup=snap_keyboard(), parse_mode="Markdown")
+    await update.effective_chat.send_message(NOTICE_MSG, parse_mode="Markdown")
+
+async def on_snap_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q:
+        await q.answer("حيّاك!")
+        await q.edit_message_reply_markup(reply_markup=None)
+    await update.effective_chat.send_message("أرسل الرابط الآن 👇")
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    text = update.message.text or ""
+    m = URL_RGX.search(text)
+    if not m:
+        await update.message.reply_text("أرسل رابط الفيديو مباشرة 👇")
+        return
+
+    url = m.group(0)
+    await update.message.reply_text("⏳ جاري التحميل بأعلى جودة متاحة…")
+
+    try:
+        file_path = download_media(url)
+        file_name = file_path.name
+
+        # دائمًا نرسل كـ document (مثل طلبك) لتفادي ضغط/تحويل التيليجرام
+        async with ctx.bot:
+            with file_path.open("rb") as f:
+                await update.effective_chat.send_document(
+                    document=InputFile(f, filename=file_name),
+                    caption=f"تم التحميل ✅\n{url}"
+                )
+
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e)
+        # انستا غالبًا يحتاج كوكيز/تسجيل دخول – نشرح للمستخدم باختصار
+        if "login required" in msg.lower() or "rate-limit" in msg.lower():
+            tip = "انستقرام قد يتطلب تسجيل دخول. حاليًا نعمل بدون كوكيز.\nجرب رابطًا آخر أو منصة مختلفة."
+        else:
+            tip = "تأكد من صحة الرابط أو جرب لاحقًا."
+        await update.effective_chat.send_text(f"❌ حدث خطأ أثناء التحميل.\n\nالمنصة قد تمنع التحميل أو تتطلب تسجيل دخول.\n{tip}")
+        log.exception("yt-dlp error")
+
+    except Exception as e:
+        await update.effective_chat.send_text("❌ حدث خطأ غير متوقع.")
+        log.exception("unexpected error")
+
+# ========= تشغيل =========
+def build_application() -> Application:
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_snap_back, pattern="^snap_back$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    return app
 
 def main():
-    # شغّل Flask أولًا في ثريد جانبي
-    Thread(target=run_flask, daemon=True).start()
+    # شغّل Flask في خلفية
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    # شغّل البوت في الـ Main Thread لتفادي مشاكل event loop
-    app_tg = build_app()
-    log.info("✅ Logged in, starting polling…")
-    # run_polling يدير الـ loop بنفسه. لا نستخدم asyncio.run هنا.
-    app_tg.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        stop_signals=None,   # لا تسجل إشارات OS (مهم على بعض المنصات)
-        close_loop=True
-    )
+    # شغّل تيليجرام في الـ main thread (عشان مشاكل الإشارات/اللووب)
+    application = build_application()
+    # حذف أي webhook سابق والتحويل إلى polling
+    async def _prep():
+        try:
+            me = await application.bot.get_me()
+            log.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
+            await application.bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            log.exception("webhook cleanup failed")
+
+    asyncio.run(_prep())
+    log.info("✅ Telegram polling started")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
