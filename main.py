@@ -1,53 +1,30 @@
-# main.py
-import os, re, tempfile, logging
-from threading import Thread
+# main.py — Telegram media bot (TikTok + Twitter/X) + Snap button
+import os
+import re
+import asyncio
+import logging
+import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
 
-from flask import Flask
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.constants import ChatAction
+from aiohttp import web
+
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+)
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes,
+    filters
 )
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+import yt_dlp
 
-# ===== إعدادات عامة =====
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # لا تكتب "bot" هنا، التوكن فقط
-SNAP_URL = "https://snapchat.com/add/uckr"
+# ---------- الإعدادات ----------
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # لا تضع التوكن صريحاً، خله من env في Render
+PORT = int(os.getenv("PORT", "10000"))
 
-# المسموح: YouTube / Instagram / X / Snapchat / TikTok
-ALLOWED_HOSTS = {
-    # YouTube
-    "youtube.com", "www.youtube.com", "youtu.be",
-    # X (Twitter)
-    "twitter.com", "www.twitter.com", "x.com", "www.x.com",
-    # Snapchat
-    "snapchat.com", "www.snapchat.com", "story.snapchat.com",
-    # Instagram
-    "instagram.com", "www.instagram.com",
-    # TikTok (كل الأشكال الجديدة)
-    "tiktok.com", "www.tiktok.com", "m.tiktok.com",
-    "v.tiktok.com", "vt.tiktok.com", "vm.tiktok.com"
-}
+SNAP_URL = "https://www.snapchat.com/add/uckr"  # عدّل رابط سنابك هنا
 
-# يلقط أول رابط في النص
-URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
-
-# ===== Flask للـ Health Check =====
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "OK — bot alive"
-
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), use_reloader=False)
-
-# ===== أزرار ورسائل =====
+# رسائل + أزرار
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
@@ -63,154 +40,149 @@ NOTICE_MSG = (
     "⚠️ **تنبيه مهم:**\n"
     "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
     "رجاءً استخدمه في الخير فقط.\n\n"
-    "أرسل رابط من: YouTube / Instagram / X / Snapchat / TikTok."
+    "أرسل رابط من: **TikTok / Twitter (X)**."
 )
 
-# ===== مساعدات =====
-def is_allowed(url: str) -> bool:
-    try:
-        host = (urlparse(url).hostname or "").lower()
-        # أحيانًا تيك توك يحط // بعد الدومين، السطر التالي يتجاهلها
-        host = host.strip("/")
-        return host in ALLOWED_HOSTS
-    except Exception:
-        return False
+# أنماط الروابط المدعومة
+RE_TIKTOK = re.compile(r"(?:https?://)?(?:www\.)?(?:tiktok\.com|vt\.tiktok\.com)/", re.I)
+RE_TWITTER = re.compile(r"(?:https?://)?(?:twitter\.com|x\.com)/", re.I)
 
-def yt_best_format() -> str:
-    # بدون تخفيض جودة: أفضل فيديو + أفضل صوت، ثم أفضل صيغة متوفرة
-    return "bv*+ba/b/best"
+# ---------- إعداد yt-dlp ----------
+# نمنع أي إعادة ترميز ونطلب أفضل mp4/ m4a قدر الإمكان
+YDL_OPTS_BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    "noprogress": True,
+    "noplaylist": True,
+    "merge_output_format": "mp4",   # دمج بدون إعادة ترميز
+    "postprocessors": [],           # لا FFmpeg re-encode
+    # أعلى جودة ممكنة بدون إجبار ترميز جديد
+    "format": (
+        "bv*[ext=mp4]+ba[ext=m4a]/"
+        "bv*+ba/b[ext=mp4]/b/best"
+    ),
+    "outtmpl": "%(title).200B.%(ext)s",
+    # تعطيل قيود السرعة الافتراضية
+    "ratelimit": 0,
+}
 
-# ===== Handlers =====
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
+
+# ---------- تحميل الوسائط ----------
+async def download_media(url: str) -> Path:
+    temp_dir = Path(tempfile.mkdtemp(prefix="grab-"))
+    out_template = str(temp_dir / "%(title).200B.%(ext)s")
+    opts = dict(YDL_OPTS_BASE)
+    opts["outtmpl"] = out_template
+
+    # خاص لتويتر: أحياناً أفضل ملف mp4 موجود باسم container=mp4
+    if RE_TWITTER.search(url):
+        opts["format"] = (
+            "((bv*[vcodec~='^((?!av01).)*$'][ext=mp4])"
+            "+(ba[acodec~='^((?!opus).)*$'][ext=m4a]))/"
+            "best[ext=mp4]/best"
+        )
+
+    def _run():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            path = Path(ydl.prepare_filename(info))
+            # في حال الدمج ينتج اسم مُختلف أحياناً
+            if not path.exists():
+                # ابحث عن ملف mp4 في المجلد
+                for p in temp_dir.iterdir():
+                    if p.suffix.lower() in (".mp4", ".mov", ".m4v"):
+                        return p
+            return path
+
+    loop = asyncio.get_running_loop()
+    file_path: Path = await loop.run_in_executor(None, _run)
+    return file_path
+
+# ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("welcomed"):
-        context.user_data["welcomed"] = True
-        await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown", reply_markup=snap_keyboard())
-    else:
-        await update.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
+    await update.effective_chat.send_message(WELCOME_MSG, reply_markup=snap_keyboard(), parse_mode="Markdown")
+    await update.effective_chat.send_message(NOTICE_MSG, parse_mode="Markdown")
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "ارسل رابط فيديو/صورة من المنصات المدعومة، وسأرسل لك الوسائط مباشرة كفيديو/صورة.",
-        reply_markup=snap_keyboard()
-    )
+async def on_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer("يعطيك العافية ✅")
+    await update.callback_query.message.reply_text("أرسل الرابط الآن 👇")
 
-async def snap_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
+def is_supported(url: str) -> bool:
+    return bool(RE_TIKTOK.search(url) or RE_TWITTER.search(url))
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    m = URL_RE.search(text)
-    if not m:
-        return
-
-    url = m.group(1)
-    if not is_allowed(url):
-        await update.message.reply_text(
-            "❌ الرابط غير مدعوم. المنصات: YouTube / Instagram / X / Snapchat / TikTok.",
-            reply_markup=snap_keyboard()
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.effective_message.text or "").strip()
+    if not is_supported(text):
+        await update.effective_message.reply_text(
+            "أرسل رابط **TikTok** أو **Twitter (X)** فقط حاليًا.",
+            parse_mode="Markdown"
         )
         return
 
-    await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
-
+    msg = await update.effective_message.reply_text("⏳ يتم التحميل…")
     try:
-        import yt_dlp
-    except Exception:
-        await update.message.reply_text("❌ مكتبة yt-dlp غير مثبتة على السيرفر.")
-        return
+        path = await download_media(text)
+        caption = Path(path).stem[:1024]
 
-    tmp_ok = False
-    last_err = None
+        # نرسل كـ Document حتى ما يعيد تيليجرام ضغط/تغيير الأبعاد
+        async with await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=InputFile(path.open("rb"), filename=path.name),
+            caption=caption
+        ) as _:
+            pass
 
-    # نجرب التحميل بجودة عالية دون تخفيض. إذا كبر جدًا لتيلجرام، نخبر المستخدم.
-    with tempfile.TemporaryDirectory() as td:
-        outtmpl = str(Path(td) / "%(title).80s.%(ext)s")
-        ydl_opts = {
-            "outtmpl": outtmpl,
-            "format": yt_best_format(),
-            "merge_output_format": "mp4",
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "restrictfilenames": True,
-            "concurrent_fragment_downloads": 1,
-        }
+        await msg.edit_text("✅ تم الإرسال كملف (Document) بدون أي تغيير في المقاس/الجودة.")
+    except yt_dlp.utils.DownloadError as e:
+        log.exception("yt-dlp error")
+        await msg.edit_text(f"❌ تعذر التحميل: {e.exc_info[1] if hasattr(e, 'exc_info') else str(e)}")
+    except Exception as e:
+        log.exception("unexpected")
+        await msg.edit_text(f"❌ حدث خطأ غير متوقع: {e}")
 
-        info = None
-        file_path: Path | None = None
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                # حاول إيجاد الملف الناتج
-                if isinstance(info, dict) and info.get("_filename"):
-                    file_path = Path(info["_filename"])
-                if not file_path or not file_path.exists():
-                    for p in Path(td).iterdir():
-                        if p.is_file():
-                            file_path = p
-                            break
-        except Exception as e:
-            last_err = e
+# ---------- AIOHTTP Health (لـ Render) ----------
+async def health(_: web.Request):
+    return web.Response(text="OK")
 
-        if file_path and file_path.exists():
-            title = (isinstance(info, dict) and info.get("title")) or "المقطع"
-            title = (title or "المقطع")[:990]
-            suffix = file_path.suffix.lower()
+async def run_http_server():
+    app = web.Application()
+    app.add_routes([web.get("/", health)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("HTTP health server on :%s", PORT)
 
-            try:
-                if suffix in {".mp4", ".mov", ".mkv", ".webm"}:
-                    await update.message.reply_video(video=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
-                    tmp_ok = True
-                elif suffix in {".jpg", ".jpeg", ".png", ".gif"}:
-                    await update.message.reply_photo(photo=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
-                    tmp_ok = True
-                else:
-                    last_err = Exception(f"نوع وسائط غير مدعوم للإرسال المباشر: {suffix}")
-            except Exception as e:
-                last_err = e
+# ---------- الإقلاع ----------
+async def run_bot():
+    application = Application.builder().token(TOKEN).build()
 
-    if not tmp_ok:
-        # حدود تيليجرام للبوتات على رفع الفيديوهات/الصور تسبب فشل المقاطع الكبيرة جداً.
-        msg = (
-            "❌ تعذّر إرسال الوسائط مباشرة.\n"
-            "السبب الشائع: حجم الفيديو أكبر من حد تيليجرام للبوتات.\n"
-            "جرّب رابط بجودة أقل/مدة أقصر، أو اعطني رابط آخر."
-        )
-        # لو فيه خطأ داخلي نطبعه للّوق فقط
-        if last_err:
-            log.exception("Send failed", exc_info=last_err)
-        await update.message.reply_text(msg, reply_markup=snap_keyboard())
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(on_back_cb, pattern="^snap_back$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-# ===== تشغيل البوت (Polling في الخيط الرئيسي) + Flask في خيط جانبي =====
-def run_bot_blocking():
+    # لا نسجّل سيجنالات (رن داخل نفس اللوب)
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    await application.initialize()
+    await application.start()
+    log.info("✅ Bot polling started")
+
+    # شغّل سيرفر الصحة و polling معًا
+    await run_http_server()
+    try:
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await application.updater.wait_until_stopped()
+    finally:
+        await application.stop()
+        await application.shutdown()
+
+def main():
     if not TOKEN:
-        raise RuntimeError("حدد TELEGRAM_TOKEN في بيئة Render.")
-    app_tg = Application.builder().token(TOKEN).build()
-
-    # فحص سريع للتوكن واسم البوت
-    async def _probe(_app):
-        me = await _app.bot.get_me()
-        log.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
-        # امسح أي Webhook لأننا نستخدم polling
-        await _app.bot.delete_webhook()
-
-    app_tg.post_init = _probe
-
-    # الهاندلرز
-    app_tg.add_handler(CommandHandler("start", start))
-    app_tg.add_handler(CommandHandler("help", help_cmd))
-    app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
-    app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-
-    # مهم: استدعاء run_polling "بدون asyncio.run" في الخيط الرئيسي
-    # حتى ما يصير تضارب لوب/سيغنال.
-    log.info("✅ Telegram polling started")
-    app_tg.run_polling(allowed_updates=Update.ALL_TYPES)
+        raise RuntimeError("TELEGRAM_TOKEN مفقود من Environment Variables.")
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
-    # شغّل Flask في خيط جانبي
-    Thread(target=run_flask, daemon=True).start()
-    # خلي البوت في الخيط الرئيسي
-    run_bot_blocking()
+    main()
