@@ -1,5 +1,5 @@
-# main.py — PTB v21 + Flask + دعم TikTok vt.tiktok.com
-import os, re, tempfile, logging, asyncio
+# main.py — Telegram media bot (PTB v21) + Flask healthcheck
+import os, re, tempfile, logging
 from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
@@ -13,41 +13,40 @@ from telegram.ext import (
 )
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 # ===== الإعدادات =====
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # لا تكتب bot هنا؛ التوكن فقط
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 SNAP_URL = "https://snapchat.com/add/uckr"
 
-# المسموح: YouTube / Instagram / X / Snapchat / TikTok (+ جميع سب دومينات تيك توك مثل vt.tiktok.com)
-ALLOWED_HOSTS_EXACT = {
+# السماح لمنصات محددة (مضاف TikTok القصير vt.tiktok.com)
+ALLOWED_HOSTS = {
     # YouTube
-    "youtube.com", "www.youtube.com", "youtu.be",
-    # X (Twitter)
-    "twitter.com", "www.twitter.com", "x.com", "www.x.com",
-    # Snapchat
-    "snapchat.com", "www.snapchat.com", "story.snapchat.com",
+    "youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
+    # X / Twitter
+    "x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com",
     # Instagram
     "instagram.com", "www.instagram.com",
+    # Snapchat
+    "snapchat.com", "www.snapchat.com", "story.snapchat.com",
+    # TikTok (كل الصيغ الشائعة + القصير)
+    "tiktok.com", "www.tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
+    "vxtiktok.com", "www.vxtiktok.com"  # احتياط للروابط المتحولة
 }
-# لأي مضيف يحتوي tiktok.com نسمح به (vt.tiktok.com, m.tiktok.com, vm.tiktok.com, …)
-def host_allowed(host: str) -> bool:
-    host = host.lower()
-    return host in ALLOWED_HOSTS_EXACT or ("tiktok.com" in host)
 
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 
-# أحجام لمحاولة تقليل الحجم لإرسال فيديو/صورة فقط
-TARGET_SIZES = [45 * 1024 * 1024, 28 * 1024 * 1024, 18 * 1024 * 1024]
+# أحجام نجربها بالتدريج حتى نضمن الإرسال كـ فيديو/صورة (تيليجرام Bots غالبًا ~50MB)
+TARGET_SIZES = [48 * 1024 * 1024, 36 * 1024 * 1024, 24 * 1024 * 1024, 16 * 1024 * 1024]
 
 # ===== Flask للـ Health Check =====
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running!"
+    return "OK - bot alive"
 
-# ===== الواجهة والأزرار =====
+# ===== واجهة وأزرار =====
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
@@ -60,31 +59,37 @@ WELCOME_MSG = (
     f"🔗 {SNAP_URL}\n\n"
     "بعد الإضافة، ارجع واضغط **تم، رجعت** أو أرسل **/start** مرة ثانية."
 )
-
 NOTICE_MSG = (
     "⚠️ **تنبيه مهم:**\n"
     "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
     "رجاءً استخدمه في الخير فقط.\n\n"
-    "الآن أرسل رابط الميديا من: YouTube / Instagram / X / Snapchat / TikTok."
+    "الآن أرسل رابط الميديا من: **YouTube / Instagram / X / Snapchat / TikTok**."
 )
-
-def pick_format_for(limit_bytes: int | None) -> str:
-    if limit_bytes is None:
-        return "bv*+ba/best"
-    return (
-        f"(bv*+ba/b)[filesize<={limit_bytes}]/"
-        f"(bv*+ba/b)[filesize_approx<={limit_bytes}]/"
-        "bv*[height<=480]+ba/b[height<=480]/"
-        "bv*[height<=360]+ba/b[height<=360]/"
-        "b"
-    )
 
 def is_allowed(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
-        return host_allowed(host)
+        # بعض روابط TikTok تكون بدون www وعلى vt.tiktok.com — مغطّينها
+        return host in ALLOWED_HOSTS
     except Exception:
         return False
+
+def pick_format_for(limit_bytes: int | None) -> str:
+    """
+    تنسيق انتقائي يفضّل فيديو+صوت ضمن حد الحجم.
+    """
+    if limit_bytes is None:
+        return "bv*+ba/best"
+    # نجرب بقيود الحجم، وإذا ما ضبط ننزل الدقة
+    return (
+        f"(bv*+ba/b)[filesize<={limit_bytes}]/"
+        f"(bv*+ba/b)[filesize_approx<={limit_bytes}]/"
+        f"b[filesize<={limit_bytes}]/"
+        f"b[filesize_approx<={limit_bytes}]/"
+        "bv*[height<=480]+ba/b[height<=480]/"
+        "bv*[height<=360]+ba/b[height<=360]/"
+        "b"
+    )
 
 # ===== Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -97,18 +102,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أرسل رابط فيديو/صورة من: YouTube / Instagram / X / Snapchat / TikTok.\n"
-        "يتم الإرسال كـ **فيديو/صورة فقط** (بدون ملفات).",
-        reply_markup=snap_keyboard(),
-        parse_mode="Markdown"
+        "الإرسال يكون كـ **فيديو/صورة فقط** بدون ملفات مرفقة.",
+        reply_markup=snap_keyboard()
     )
 
 async def snap_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    await update.callback_query.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(NOTICE_MSG, parse_mode="Markdown")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
     text = (update.message.text or "").strip()
     m = URL_RE.search(text)
     if not m:
@@ -117,14 +120,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = m.group(1)
     if not is_allowed(url):
         await update.message.reply_text(
-            "❌ غير مدعوم. المسموح: YouTube / Instagram / X / Snapchat / TikTok.",
+            "❌ غير مدعوم. هذا البوت يدعم فقط: YouTube / Instagram / X / Snapchat / TikTok.",
             reply_markup=snap_keyboard()
         )
         return
 
-    await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+    # إظهار “جاري الرفع” (فيديو/صورة)
+    await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
 
-    # yt-dlp
     try:
         import yt_dlp
     except Exception:
@@ -148,6 +151,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "restrictfilenames": True,
                 "nocheckcertificate": True,
                 "concurrent_fragment_downloads": 1,
+                # TikTok أحيانًا يحتاج UA حديث — yt-dlp غالبًا يضبط لوحده
+                # "http_headers": {"User-Agent": "Mozilla/5.0"},
             }
 
             info = None
@@ -157,7 +162,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     if isinstance(info, dict):
-                        file_path = Path(info.get("_filename") or "")
+                        fp = info.get("_filename") or ""
+                        if fp:
+                            file_path = Path(fp)
                     if not file_path or not file_path.exists():
                         for p in td_path.iterdir():
                             if p.is_file():
@@ -170,17 +177,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not file_path or not file_path.exists():
                 continue
 
-            title = (info.get("title") if isinstance(info, dict) else "الملف") or "الملف"
-            title = title[:990]
+            title = (isinstance(info, dict) and info.get("title")) or "الملف"
+            title = (title or "الملف")[:990]
             suffix = file_path.suffix.lower()
 
             try:
                 if suffix in {".mp4", ".mov", ".mkv", ".webm"}:
-                    await update.message.reply_video(video=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
+                    await update.message.reply_video(
+                        video=file_path.open("rb"),
+                        caption=title,
+                        reply_markup=snap_keyboard()
+                    )
                     sent_ok = True
                     break
                 elif suffix in {".jpg", ".jpeg", ".png", ".gif"}:
-                    await update.message.reply_photo(photo=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
+                    await update.message.reply_photo(
+                        photo=file_path.open("rb"),
+                        caption=title,
+                        reply_markup=snap_keyboard()
+                    )
                     sent_ok = True
                     break
                 else:
@@ -191,44 +206,52 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
     if not sent_ok:
-        logger.exception("Send failed", exc_info=last_error)
-        await update.message.reply_text(
+        msg = (
             "❌ تعذّر إرسال الوسائط حتى بعد تخفيض الجودة.\n"
-            "جرّب فيديو أقصر/جودة أقل.",
-            reply_markup=snap_keyboard()
+            "• جرّب رابطًا مباشرًا من نفس المنصة.\n"
+            "• أو فيديو أقصر/جودة أقل."
         )
+        await update.message.reply_text(msg, reply_markup=snap_keyboard())
+        if last_error:
+            log.exception("Send failed", exc_info=last_error)
 
-# ===== تشغيل تيليجرام داخل ثريد مستقل (بدون مشاكل الإشارات) =====
-def start_telegram_thread():
-    def runner():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+# ===== تشغيل =====
+def run_flask():
+    # نشغّل Flask بخيط جانبي كـ healthcheck
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), use_reloader=False)
 
-        app_tg = Application.builder().token(TOKEN).build()
-        app_tg.add_handler(CommandHandler("start", start))
-        app_tg.add_handler(CommandHandler("help", help_cmd))
-        app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
-        app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-
-        async def boot():
-            # تأكيد التوكن + حذف أي ويبهوك + بدء البولنج
-            me = await app_tg.bot.get_me()
-            logger.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
-            await app_tg.bot.delete_webhook(drop_pending_updates=True)
-            logger.info("✅ Telegram polling started")
-            await app_tg.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                stop_signals=None,     # مهم داخل الثريد
-                close_loop=False       # لا تقفل اللوب حقنا
-            )
-
-        loop.run_until_complete(boot())
-
-    Thread(target=runner, daemon=True).start()
-
-# ===== Main =====
-if __name__ == "__main__":
+def main():
     if not TOKEN:
         raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
-    start_telegram_thread()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
+    # شغّل Flask في الخلفية
+    Thread(target=run_flask, daemon=True).start()
+
+    # ابني تطبيق تيليجرام
+    application = Application.builder().token(TOKEN).build()
+
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
+    # تأكيد الدخول + مسح أي Webhook قديم
+    async def _post_init(app: Application):
+        me = await app.bot.get_me()
+        log.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
+        log.info("✅ Telegram polling started")
+
+    application.post_init = _post_init
+
+    # IMPORTANT:
+    # نخلي polling في الخيط الرئيسي (main thread) عشان إشارات النظام،
+    # ونمنع المشاكل اللي كانت تظهر لما نشغّله داخل ثريد ثاني.
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
