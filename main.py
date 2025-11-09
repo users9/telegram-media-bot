@@ -1,10 +1,11 @@
-# main.py — Telegram media bot (PTB v21) + Flask healthcheck
+# main.py — PTB v21.6 + Flask + ffmpeg via imageio-ffmpeg
 import os, re, tempfile, logging
-from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse
 
 from flask import Flask
+from threading import Thread
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -15,38 +16,36 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ===== الإعدادات =====
+# ====== إعدادات عامة ======
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 SNAP_URL = "https://snapchat.com/add/uckr"
 
-# السماح لمنصات محددة (مضاف TikTok القصير vt.tiktok.com)
+# منع التخفيض: نحاول دائمًا أعلى جودة
+FORCE_BEST_QUALITY = True
+
+# دعم المنصات + نطاقات تيك توك الجديدة
 ALLOWED_HOSTS = {
     # YouTube
-    "youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
-    # X / Twitter
-    "x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com",
-    # Instagram
-    "instagram.com", "www.instagram.com",
+    "youtube.com","www.youtube.com","youtu.be",
+    # X (Twitter)
+    "twitter.com","www.twitter.com","x.com","www.x.com",
     # Snapchat
-    "snapchat.com", "www.snapchat.com", "story.snapchat.com",
-    # TikTok (كل الصيغ الشائعة + القصير)
-    "tiktok.com", "www.tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
-    "vxtiktok.com", "www.vxtiktok.com"  # احتياط للروابط المتحولة
+    "snapchat.com","www.snapchat.com","story.snapchat.com",
+    # Instagram
+    "instagram.com","www.instagram.com",
+    # TikTok
+    "tiktok.com","www.tiktok.com","m.tiktok.com","vm.tiktok.com","vt.tiktok.com"
 }
 
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 
-# أحجام نجربها بالتدريج حتى نضمن الإرسال كـ فيديو/صورة (تيليجرام Bots غالبًا ~50MB)
-TARGET_SIZES = [48 * 1024 * 1024, 36 * 1024 * 1024, 24 * 1024 * 1024, 16 * 1024 * 1024]
-
-# ===== Flask للـ Health Check =====
+# ====== Flask Health Check ======
 app = Flask(__name__)
-
 @app.route("/")
 def home():
-    return "OK - bot alive"
+    return "Bot is running!"
 
-# ===== واجهة وأزرار =====
+# ====== UI ======
 def snap_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👻 إضافة السناب", url=SNAP_URL)],
@@ -63,35 +62,27 @@ NOTICE_MSG = (
     "⚠️ **تنبيه مهم:**\n"
     "لا أُحِل ولا أتحمّل أي مسؤولية عن استخدام البوت في تحميل ما لا يرضي الله.\n"
     "رجاءً استخدمه في الخير فقط.\n\n"
-    "الآن أرسل رابط الميديا من: **YouTube / Instagram / X / Snapchat / TikTok**."
+    "أرسل رابط الميديا من: YouTube / Instagram / X / Snapchat / TikTok."
 )
 
+# ====== Helpers ======
 def is_allowed(url: str) -> bool:
     try:
         host = (urlparse(url).hostname or "").lower()
-        # بعض روابط TikTok تكون بدون www وعلى vt.tiktok.com — مغطّينها
-        return host in ALLOWED_HOSTS
+        # بعض روابط تيك توك المختصرة قد لا تحمل host واضح — نترك yt-dlp يتعامل معها
+        return (host in ALLOWED_HOSTS) or ("tiktok.com" in (host or ""))
     except Exception:
         return False
 
-def pick_format_for(limit_bytes: int | None) -> str:
+def best_format_string() -> str:
     """
-    تنسيق انتقائي يفضّل فيديو+صوت ضمن حد الحجم.
+    نحاول أعلى جودة ممكنة:
+    1) أفضل فيديو + أفضل صوت (يتطلب ffmpeg للدمج)
+    2) إن فشل الدمج، سنحاول أفضل ملف واحد جاهز (b/best)
     """
-    if limit_bytes is None:
-        return "bv*+ba/best"
-    # نجرب بقيود الحجم، وإذا ما ضبط ننزل الدقة
-    return (
-        f"(bv*+ba/b)[filesize<={limit_bytes}]/"
-        f"(bv*+ba/b)[filesize_approx<={limit_bytes}]/"
-        f"b[filesize<={limit_bytes}]/"
-        f"b[filesize_approx<={limit_bytes}]/"
-        "bv*[height<=480]+ba/b[height<=480]/"
-        "bv*[height<=360]+ba/b[height<=360]/"
-        "b"
-    )
+    return "bv*+ba/best"
 
-# ===== Handlers =====
+# ====== Handlers ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("welcomed"):
         context.user_data["welcomed"] = True
@@ -102,7 +93,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أرسل رابط فيديو/صورة من: YouTube / Instagram / X / Snapchat / TikTok.\n"
-        "الإرسال يكون كـ **فيديو/صورة فقط** بدون ملفات مرفقة.",
+        "أحاول دائمًا أعلى جودة ممكنة. لو الملف ضخم جدًا قد يرفضه تيليجرام.",
         reply_markup=snap_keyboard()
     )
 
@@ -125,133 +116,120 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # إظهار “جاري الرفع” (فيديو/صورة)
-    await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
+    await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
 
     try:
         import yt_dlp
     except Exception:
-        await update.message.reply_text("❌ مكتبة yt-dlp غير مثبتة.")
+        await update.message.reply_text("❌ yt-dlp غير مثبت.")
         return
 
-    last_error = None
-    sent_ok = False
+    # ffmpeg عبر imageio-ffmpeg (تنزيل تلقائي لبيناري ffmpeg واستخدامه)
+    ffmpeg_dir = None
+    try:
+        import imageio_ffmpeg
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        ffmpeg_dir = os.path.dirname(ffmpeg_path)
+    except Exception as e:
+        log.warning("ffmpeg unavailable, merge may fail: %s", e)
 
-    for limit in TARGET_SIZES + [None]:
-        with tempfile.TemporaryDirectory() as td:
-            td_path = Path(td)
-            outtmpl = str(td_path / "%(title).80s.%(ext)s")
-            ydl_opts = {
-                "outtmpl": outtmpl,
-                "format": pick_format_for(limit),
-                "merge_output_format": "mp4",
-                "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
-                "restrictfilenames": True,
-                "nocheckcertificate": True,
-                "concurrent_fragment_downloads": 1,
-                # TikTok أحيانًا يحتاج UA حديث — yt-dlp غالبًا يضبط لوحده
-                # "http_headers": {"User-Agent": "Mozilla/5.0"},
-            }
+    # نحاول أعلى جودة مرة واحدة فقط (بدون تخفيض)
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        outtmpl = str(td_path / "%(title).80s.%(ext)s")
+        ydl_opts = {
+            "outtmpl": outtmpl,
+            "format": best_format_string() if FORCE_BEST_QUALITY else "best",
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "restrictfilenames": True,
+            "nocheckcertificate": True,
+            "concurrent_fragment_downloads": 1,
+        }
+        if ffmpeg_dir:
+            ydl_opts["ffmpeg_location"] = ffmpeg_dir
 
-            info = None
-            file_path: Path | None = None
+        info = None
+        file_path: Path | None = None
 
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    if isinstance(info, dict):
-                        fp = info.get("_filename") or ""
-                        if fp:
-                            file_path = Path(fp)
-                    if not file_path or not file_path.exists():
-                        for p in td_path.iterdir():
-                            if p.is_file():
-                                file_path = p
-                                break
-            except Exception as e:
-                last_error = e
-                continue
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                # حاول استنتاج اسم الملف الناتج
+                candidate = info.get("_filename") if isinstance(info, dict) else None
+                if candidate:
+                    p = Path(candidate)
+                    if p.exists():
+                        file_path = p
+                if not file_path:
+                    for p in td_path.iterdir():
+                        if p.is_file():
+                            file_path = p
+                            break
+        except Exception as e:
+            log.exception("Download failed", exc_info=e)
+            await update.message.reply_text(
+                "❌ فشل التحميل بأعلى جودة. قد تكون المنصة تمنع أو يتطلب تسجيل دخول.\n"
+                "جرّب رابطًا آخر أو فيديو أقصر.",
+                reply_markup=snap_keyboard()
+            )
+            return
 
-            if not file_path or not file_path.exists():
-                continue
+        if not file_path or not file_path.exists():
+            await update.message.reply_text(
+                "❌ لم أتمكن من إيجاد الملف بعد التحميل.",
+                reply_markup=snap_keyboard()
+            )
+            return
 
-            title = (isinstance(info, dict) and info.get("title")) or "الملف"
-            title = (title or "الملف")[:990]
-            suffix = file_path.suffix.lower()
+        suffix = file_path.suffix.lower()
+        title = (info.get("title") if isinstance(info, dict) else "الملف") or "الملف"
+        title = title[:990]
 
-            try:
-                if suffix in {".mp4", ".mov", ".mkv", ".webm"}:
-                    await update.message.reply_video(
-                        video=file_path.open("rb"),
-                        caption=title,
-                        reply_markup=snap_keyboard()
-                    )
-                    sent_ok = True
-                    break
-                elif suffix in {".jpg", ".jpeg", ".png", ".gif"}:
-                    await update.message.reply_photo(
-                        photo=file_path.open("rb"),
-                        caption=title,
-                        reply_markup=snap_keyboard()
-                    )
-                    sent_ok = True
-                    break
-                else:
-                    last_error = Exception(f"Unsupported media type: {suffix}")
-                    continue
-            except Exception as e:
-                last_error = e
-                continue
+        try:
+            if suffix in {".mp4", ".mov", ".mkv", ".webm"}:
+                await update.message.reply_video(video=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
+            elif suffix in {".jpg", ".jpeg", ".png", ".gif"}:
+                await update.message.reply_photo(photo=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
+            else:
+                # نحاول كفيديو على أي حال لو mp4 غير موجود
+                await update.message.reply_video(video=file_path.open("rb"), caption=title, reply_markup=snap_keyboard())
+        except Exception as e:
+            log.exception("Send failed", exc_info=e)
+            await update.message.reply_text(
+                "❌ فشل إرسال الوسائط. غالبًا حجم الملف كبير ويتجاوز حد تيليجرام للبوت.\n"
+                "جرّب فيديو أقصر أو جودة أقل على نفس الرابط.",
+                reply_markup=snap_keyboard()
+            )
 
-    if not sent_ok:
-        msg = (
-            "❌ تعذّر إرسال الوسائط حتى بعد تخفيض الجودة.\n"
-            "• جرّب رابطًا مباشرًا من نفس المنصة.\n"
-            "• أو فيديو أقصر/جودة أقل."
-        )
-        await update.message.reply_text(msg, reply_markup=snap_keyboard())
-        if last_error:
-            log.exception("Send failed", exc_info=last_error)
-
-# ===== تشغيل =====
-def run_flask():
-    # نشغّل Flask بخيط جانبي كـ healthcheck
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), use_reloader=False)
-
-def main():
+def build_app() -> Application:
     if not TOKEN:
         raise RuntimeError("حدد TELEGRAM_TOKEN في Render → Environment.")
+    app_tg = Application.builder().token(TOKEN).build()
+    app_tg.add_handler(CommandHandler("start", start))
+    app_tg.add_handler(CommandHandler("help", help_cmd))
+    app_tg.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
+    app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    return app_tg
 
-    # شغّل Flask في الخلفية
-    Thread(target=run_flask, daemon=True).start()
-
-    # ابني تطبيق تيليجرام
-    application = Application.builder().token(TOKEN).build()
-
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CallbackQueryHandler(snap_back_callback, pattern="^snap_back$"))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-
-    # تأكيد الدخول + مسح أي Webhook قديم
-    async def _post_init(app: Application):
-        me = await app.bot.get_me()
-        log.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
-        try:
-            await app.bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
-        log.info("✅ Telegram polling started")
-
-    application.post_init = _post_init
-
-    # IMPORTANT:
-    # نخلي polling في الخيط الرئيسي (main thread) عشان إشارات النظام،
-    # ونمنع المشاكل اللي كانت تظهر لما نشغّله داخل ثريد ثاني.
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+def run_flask():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    main()
+    # شغّل Flask في ثريد جانبي
+    Thread(target=run_flask, daemon=True).start()
+
+    # شغّل تيليجرام في الثريد الرئيسي (بدون إشارات نظام لتجنّب مشاكل السيرفر)
+    tg = build_app()
+    try:
+        me = tg.bot.get_me()
+        log.info("✅ Logged in as @%s (id=%s)", me.username, me.id)
+    except Exception as e:
+        log.exception("Bot login failed", exc_info=e)
+
+    # ملاحظة: stop_signals=None لتفادي مشاكل signal على منصات الاستضافة
+    tg.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None, close_loop=False)
+    log.info("✅ Telegram polling started")
